@@ -176,15 +176,32 @@ class ResultCollector:
         self.items: List[Dict[str, Any]] = []
         self._stop_event = stop_event
         self._queue = out_queue
+        # Per-engine counters keyed by thread id, avoids racy len(items) diffs.
+        self._engine_counts: Dict[int, int] = {}
 
     def add(self, item: Dict[str, Any]) -> None:
         if self._stop_event is not None and self._stop_event.is_set():
             return
         normalized = normalize_result(item)
+        tid = threading.get_ident()
         with self._lock:
             self.items.append(normalized)
+            self._engine_counts[tid] = self._engine_counts.get(tid, 0) + 1
         if self._queue is not None:
             self._queue.put(normalized)
+
+    def add_normalized(self, item: Dict[str, Any]) -> None:
+        """Add an already-normalized item (used when draining per-engine collectors)."""
+        if self._stop_event is not None and self._stop_event.is_set():
+            return
+        with self._lock:
+            self.items.append(item)
+        if self._queue is not None:
+            self._queue.put(item)
+
+    def count_for_thread(self, tid: int) -> int:
+        with self._lock:
+            return self._engine_counts.get(tid, 0)
 
 
 def run_engine(
@@ -209,54 +226,77 @@ def run_engine(
     engine_url = getattr(engine_class, "url", "")
 
     cat = pick_category(engine_class, category)
-    novaprinter.set_thread_context(
-        engine_name=engine_name,
-        engine_url=engine_url,
-        collector=collector,
-    )
-
-    count_before = len(collector.items)
 
     if engine_timeout > 0:
         # Run search in a sub-thread with a timeout.
+        # Use a per-engine collector so timed-out orphan threads don't
+        # leak results into the shared collector after we've moved on.
+        engine_queue = queue.Queue()
+        engine_collector = ResultCollector(stop_event, engine_queue)
         result_exc = [None]
 
         def _search():
+            novaprinter.set_thread_context(
+                engine_name=engine_name,
+                engine_url=engine_url,
+                collector=engine_collector,
+            )
             try:
                 engine.search(query, cat)
             except Exception as e:
                 result_exc[0] = e
+            finally:
+                novaprinter.clear_thread_context()
 
         t = threading.Thread(target=_search, daemon=True)
         t.start()
         t.join(timeout=engine_timeout)
+
+        # Drain whatever the engine found so far into the shared collector.
+        count = 0
+        while True:
+            try:
+                item = engine_queue.get_nowait()
+                collector.add_normalized(item)
+                count += 1
+            except queue.Empty:
+                break
+
         if t.is_alive():
-            novaprinter.clear_thread_context()
             elapsed = time.monotonic() - t0
-            count_after = len(collector.items)
             return {
                 "name": engine_name,
                 "status": "timeout",
-                "results": count_after - count_before,
+                "results": count,
                 "elapsed": elapsed,
             }
         if result_exc[0] is not None:
             raise result_exc[0]
+        elapsed = time.monotonic() - t0
+        return {
+            "name": engine_name,
+            "status": "ok",
+            "results": count,
+            "elapsed": elapsed,
+        }
     else:
+        novaprinter.set_thread_context(
+            engine_name=engine_name,
+            engine_url=engine_url,
+            collector=collector,
+        )
+        caller_tid = threading.get_ident()
         try:
             engine.search(query, cat)
         finally:
             novaprinter.clear_thread_context()
-
-    novaprinter.clear_thread_context()
-    elapsed = time.monotonic() - t0
-    count_after = len(collector.items)
-    return {
-        "name": engine_name,
-        "status": "ok",
-        "results": count_after - count_before,
-        "elapsed": elapsed,
-    }
+        elapsed = time.monotonic() - t0
+        return {
+            "name": engine_name,
+            "status": "ok",
+            "results": collector.count_for_thread(caller_tid),
+            "elapsed": elapsed,
+        }
 
 
 def run_search(
@@ -307,14 +347,30 @@ def run_search(
     return collector.items, errors
 
 
+_CSV_FORMULA_CHARS = {"=", "+", "-", "@", "\t", "\r"}
+
+
+def _sanitize_csv_value(value: Any) -> Any:
+    """Prefix values that start with formula-triggering characters to prevent CSV injection."""
+    if isinstance(value, str) and value and value[0] in _CSV_FORMULA_CHARS:
+        return "'" + value
+    return value
+
+
+def _sanitize_filename(name: str) -> str:
+    """Remove characters unsafe for filenames."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+
+
 def results_to_csv(results: List[Dict[str, Any]]) -> str:
-    """Convert results to a CSV string."""
+    """Convert results to a CSV string with formula-injection protection."""
     buf = io.StringIO()
     fields = ["name", "size", "seeds", "leech", "engine_name", "link", "desc_link"]
     writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     for row in results:
-        writer.writerow(row)
+        safe_row = {k: _sanitize_csv_value(v) for k, v in row.items()}
+        writer.writerow(safe_row)
     return buf.getvalue()
 
 
@@ -407,19 +463,19 @@ with st.sidebar:
     st.header("Engines")
     st.caption(f"{len(display_labels)} plugins available")
 
-    # Quick select/deselect all
+    # Quick select/deselect all - write directly to the widget's key
     sb_col1, sb_col2 = st.columns(2)
     with sb_col1:
         if st.button("Select all", use_container_width=True):
-            st.session_state["_plugin_selection"] = display_labels
+            st.session_state["plugin_multiselect"] = display_labels
     with sb_col2:
         if st.button("Deselect all", use_container_width=True):
-            st.session_state["_plugin_selection"] = []
+            st.session_state["plugin_multiselect"] = []
 
     selected_labels = st.multiselect(
         "Plugins",
         options=display_labels,
-        default=st.session_state.get("_plugin_selection", display_labels),
+        default=display_labels,
         key="plugin_multiselect",
     )
 
@@ -520,7 +576,7 @@ with col4:
         st.download_button(
             "Export CSV",
             data=csv_data,
-            file_name=f"p2p_{state.get('last_query', 'results')}_{datetime.now():%Y%m%d_%H%M}.csv",
+            file_name=f"p2p_{_sanitize_filename(state.get('last_query', 'results'))}_{datetime.now():%Y%m%d_%H%M}.csv",
             mime="text/csv",
         )
 
@@ -551,7 +607,7 @@ def launch_search() -> None:
     _timeout = engine_timeout
 
     def _worker():
-        _, errors = run_search(
+        items, errors = run_search(
             query=_query,
             category=_category,
             selected_paths=_paths,
@@ -563,13 +619,14 @@ def launch_search() -> None:
         )
         state["errors"] = errors
 
-        # Save to history
+        # Save to history. Use `items` (the collector's authoritative list)
+        # rather than state["results"] which depends on queue draining.
         hist = st.session_state.get("search_history", [])
         hist.append({
             "query": _query,
             "category": _category,
             "time": datetime.now().isoformat(),
-            "count": len(state["results"]),
+            "count": len(items),
         })
         # Keep history bounded
         if len(hist) > MAX_HISTORY:
@@ -616,14 +673,15 @@ if results:
     if min_seeds > 0:
         filtered = [r for r in filtered if parse_int(r.get("seeds"), 0) >= int(min_seeds)]
 
-    # --- Name filter ---
+    # --- Name filter (regex supported, capped at 200 chars to limit ReDoS risk) ---
     if name_filter.strip():
+        raw_filter = name_filter.strip()[:200]
         try:
-            pattern = re.compile(name_filter.strip(), re.IGNORECASE)
+            pattern = re.compile(raw_filter, re.IGNORECASE)
             filtered = [r for r in filtered if pattern.search(r.get("name", ""))]
         except re.error:
             # Fall back to plain substring match on bad regex.
-            lower_filter = name_filter.strip().lower()
+            lower_filter = raw_filter.lower()
             filtered = [r for r in filtered if lower_filter in r.get("name", "").lower()]
 
     # --- Size range filter ---
